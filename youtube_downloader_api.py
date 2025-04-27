@@ -60,12 +60,10 @@ async def get_formats(url: str = Query(...)):
     fmts = info.get("formats", [])
     video_map, audio_map = {}, {}
     for f in fmts:
-        # video-only
         if f.get("vcodec")!="none" and f.get("acodec")=="none":
             h = f.get("height")
             if h and (h not in video_map or f["tbr"] > video_map[h]["tbr"]):
                 video_map[h] = {"height": h, "tbr": f["tbr"]}
-        # audio-only
         if f.get("acodec")!="none" and f.get("vcodec")=="none":
             abr = f.get("abr")
             if abr and (abr not in audio_map or f["tbr"] > audio_map[abr]["tbr"]):
@@ -81,101 +79,198 @@ async def get_formats(url: str = Query(...)):
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>YouTube Downloader</title>
-<style>
- body{background:#000;color:#fff;font-family:Arial,sans-serif;text-align:center;padding:2rem}
- h1{color:#FF0000}
- input,select,button{margin:0.5rem;padding:0.5rem;font-size:1rem}
- input,select{width:60%;max-width:400px}
- button{background:#FF0000;color:#fff;border:none;cursor:pointer}
- button:disabled{opacity:0.5;cursor:default}
- #preview{margin-top:1rem}
- progress{width:60%;max-width:400px;height:1rem}
- #message{margin-top:1rem}
- a.link{color:#FF0000;text-decoration:none}
-</style></head><body>
-  <h1>YouTube Downloader</h1>
-  <input id="url" placeholder="Paste YouTube URL..." /><br>
-  <div id="preview"></div><br>
-  <select id="fmt">
-    <optgroup label="Video">
-      <option>mp4</option><option>webm</option><option>mkv</option><option>avi</option>
-    </optgroup>
-    <optgroup label="Audio">
-      <option>mp3</option><option>aac</option><option>wav</option><option>flac</option><option>m4a</option><option>opus</option>
-    </optgroup>
-  </select>
-  <select id="qual"></select><br>
-  <button id="btn">Download</button><br><br>
-  <progress id="prog" value="0" max="100"></progress>
-  <span id="percent">0%</span>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>YouTube Batch Downloader</title>
+  <style>
+    body{background:#000;color:#fff;font-family:Arial,sans-serif;padding:2rem}
+    h1{text-align:center;color:#FF0000}
+    .controls{margin-bottom:1rem;text-align:center}
+    .controls button{margin:0 .5rem;padding:.5rem 1rem;font-size:1rem;cursor:pointer;background:#FF0000;border:none;color:#fff}
+    .controls button:disabled{opacity:.5;cursor:default}
+    #items-container{max-width:600px;margin:0 auto}
+    .item{background:#111;padding:1rem;margin-bottom:1rem;position:relative}
+    .item input, .item select{width:100%;margin:.5rem 0;padding:.5rem;font-size:1rem;box-sizing: border-box}
+    .item img{width:120px;height:auto;display:block;margin:.5rem 0}
+    .remove-btn{position:absolute;top:.5rem;right:.5rem;background:#900;border:none;color:#fff;padding:.25rem .5rem;cursor:pointer}
+    #progress-container{max-width:600px;margin:2rem auto}
+    .progress-item{background:#111;padding:1rem;margin-bottom:1rem}
+    .progress-item progress{width:100%;height:1rem}
+    .progress-item span{display:inline-block;width:2rem;text-align:right;margin-left:.5rem}
+    #message{text-align:center;margin-top:1rem}
+  </style>
+</head>
+<body>
+  <h1>YouTube Batch Downloader</h1>
+  
+  <div id="items-container"></div>
+  
+  <div class="controls">
+    <button id="add-btn">Add Link</button>
+    <button id="download-btn">Download All</button>
+  </div>
+  <div id="progress-container"></div>
   <div id="message"></div>
 
 <script>
- const btn=document.getElementById('btn'),
-       urlI=document.getElementById('url'),
-       fmt=document.getElementById('fmt'),
-       qual=document.getElementById('qual'),
-       prog=document.getElementById('prog'),
-       pct=document.getElementById('percent'),
-       msg=document.getElementById('message');
- let last=0, fmts=null;
+let nextId = 0;
+const itemsFmts = {};
+const itemsContainer = document.getElementById('items-container');
+const addBtn = document.getElementById('add-btn');
+const downloadBtn = document.getElementById('download-btn');
+const progressContainer = document.getElementById('progress-container');
+const msg = document.getElementById('message');
 
- urlI.addEventListener('blur',async()=>{
-  const u=urlI.value.trim(), m=u.match(/[?&]v=([\\w-]{11})/),
-        pre=document.getElementById('preview');
-  pre.innerHTML=m?`<img src="https://img.youtube.com/vi/${m[1]}/hqdefault.jpg" width="240">`:'';
-  if(!u) return;
-  const r=await fetch(`/formats?url=${encodeURIComponent(u)}`);
-  fmts=await r.json(); updateOptions();
- });
+addBtn.addEventListener('click', addItem);
+function addItem(){
+  const id = nextId++;
+  const div = document.createElement('div');
+  div.className = 'item';
+  div.dataset.id = id;
+  div.innerHTML = `
+    <button class="remove-btn">×</button>
+    <input type="text" placeholder="YouTube URL" class="url-input"/>
+    <select class="fmt-select">
+      <optgroup label="Video">
+        <option>mp4</option><option>webm</option><option>mkv</option><option>avi</option>
+      </optgroup>
+      <optgroup label="Audio">
+        <option>mp3</option><option>aac</option><option>wav</option><option>flac</option><option>m4a</option><option>opus</option>
+      </optgroup>
+    </select>
+    <select class="qual-select"></select>
+    <img class="preview-img" src="" alt="Preview"/>
+  `;
+  itemsContainer.appendChild(div);
 
- fmt.addEventListener('change',updateOptions);
- function updateOptions(){
-  if(!fmts) return;
-  const f=fmt.value, v=['mp4','webm','mkv','avi'];
-  qual.innerHTML = v.includes(f)
-    ? fmts.video.map(o=>`<option value="${o.height}">${o.label}</option>`).join('')
-    : fmts.audio.map(o=>`<option value="${o.abr}">${o.label}</option>`).join('');
- }
+  const urlInput = div.querySelector('.url-input');
+  const fmtSelect = div.querySelector('.fmt-select');
+  const qualSelect = div.querySelector('.qual-select');
+  const previewImg = div.querySelector('.preview-img');
+  const removeBtn = div.querySelector('.remove-btn');
 
- btn.onclick=async()=>{
-  const u=urlI.value.trim(), f=fmt.value, q=qual.value;
-  if(!u) return alert('Enter a YouTube URL.');
-  btn.disabled=true; last=0; prog.value=0; pct.innerText='0%'; msg.innerText='Starting download...';
-  const r=await fetch('/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u,fmt:f,quality:q})});
-  if(!r.ok){ alert(await r.text()); btn.disabled=false; return }
-  const {task_id}=await r.json(),
-        es=new EventSource(`/progress/${task_id}`);
-  es.onmessage=e=>{
-    const d=JSON.parse(e.data);
-    if(d.total_bytes){
-      const p=Math.floor(100*d.downloaded_bytes/d.total_bytes);
-      if(p>last){ last=p; prog.value=p; pct.innerText=`${p}%` }
+  urlInput.addEventListener('blur', async()=>{
+    const url = urlInput.value.trim();
+    previewImg.src = '';
+    if(!url) return;
+    const m = url.match(/[?&]v=([\\w-]{11})/);
+    if(m) previewImg.src = `https://img.youtube.com/vi/${m[1]}/hqdefault.jpg`;
+    const res = await fetch(`/formats?url=${encodeURIComponent(url)}`);
+    const data = await res.json();
+    itemsFmts[id] = data;
+    updateQual(id);
+  });
+
+  fmtSelect.addEventListener('change', ()=>updateQual(id));
+
+  function updateQual(i){
+    const data = itemsFmts[i];
+    if(!data) return;
+    const f = fmtSelect.value;
+    const videoExts = ['mp4','webm','mkv','avi'];
+    let opts = [];
+    if(videoExts.includes(f)) {
+      opts = data.video.map(o=>({v:o.height, t:o.label}));
+    } else {
+      opts = data.audio.map(o=>({v:o.abr, t:o.label}));
     }
-    if(d.status==='finished'){ es.close(); msg.innerText='Downloading…'; window.location.href=`/download/${task_id}` }
-    if(d.status==='error'){ es.close(); alert('Download failed.'); btn.disabled=false }
-  };
- };
+    qualSelect.innerHTML = opts.map(o=>`<option value="${o.v}">${o.t}</option>`).join('');
+  }
+
+  removeBtn.addEventListener('click', ()=>div.remove());
+}
+
+// start with one item
+addItem();
+
+downloadBtn.addEventListener('click', async()=>{
+  const items = Array.from(itemsContainer.querySelectorAll('.item')).map(div=>({
+    url: div.querySelector('.url-input').value.trim(),
+    fmt: div.querySelector('.fmt-select').value,
+    quality: div.querySelector('.qual-select').value
+  })).filter(i=>i.url);
+  if(!items.length) return alert('Add at least one URL');
+  addBtn.disabled = true;
+  downloadBtn.disabled = true;
+  progressContainer.innerHTML = '';
+  msg.innerText = 'Starting downloads...';
+
+  const res = await fetch('/download',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({items})
+  });
+  if(!res.ok){
+    alert(await res.text());
+    addBtn.disabled = false;
+    downloadBtn.disabled = false;
+    return;
+  }
+  const { task_ids } = await res.json();
+
+  const promises = task_ids.map((id, idx)=>{
+    const pDiv = document.createElement('div');
+    pDiv.className = 'progress-item';
+    pDiv.innerHTML = `
+      <strong>Item ${idx+1}:</strong>
+      <progress value="0" max="100"></progress>
+      <span>0%</span>`;
+    progressContainer.appendChild(pDiv);
+    const pr = pDiv.querySelector('progress');
+    const pct = pDiv.querySelector('span');
+    return new Promise(resolve=>{
+      const es = new EventSource(`/progress/${id}`);
+      es.onmessage = e=>{
+        const d = JSON.parse(e.data);
+        if(d.total_bytes){
+          const p = Math.floor(100 * d.downloaded_bytes / d.total_bytes);
+          pr.value = p; pct.innerText = p + '%';
+        }
+        if(d.status==='finished'){
+          es.close();
+          window.open(`/download/${id}`, '_blank');
+          resolve();
+        }
+        if(d.status==='error'){
+          es.close();
+          pct.innerText = 'Error';
+          resolve();
+        }
+      };
+    });
+  });
+
+  await Promise.all(promises);
+  msg.innerText = 'All downloads finished.';
+  addBtn.disabled = false;
+  downloadBtn.disabled = false;
+});
 </script>
-</body></html>"""
+</body>
+</html>"""
 
 # -----------------------
-# POST /download → start background task
+# POST /download → handle batch items
 # -----------------------
 @app.post("/download")
-async def start_download(background_tasks: BackgroundTasks,
-                         payload: dict = Body(...)):
-    url = payload.get("url")
-    fmt = payload.get("fmt","mp4")
-    quality = payload.get("quality")
-    task_id = str(uuid.uuid4())
-    progress_store[task_id] = {
-        "status":"queued","downloaded_bytes":0,"total_bytes":0,"file_path":None
-    }
-    background_tasks.add_task(run_download, task_id, url, fmt, quality)
-    return {"task_id":task_id}
+async def start_download(background_tasks: BackgroundTasks, payload: dict = Body(...)):
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise HTTPException(400, "No items provided")
+    task_ids = []
+    for it in items:
+        url = it.get("url")
+        fmt = it.get("fmt","mp4")
+        quality = it.get("quality")
+        if not url:
+            continue
+        tid = str(uuid.uuid4())
+        progress_store[tid] = {"status":"queued","downloaded_bytes":0,"total_bytes":0,"file_path":None}
+        background_tasks.add_task(run_download, tid, url, fmt, quality)
+        task_ids.append(tid)
+    return {"task_ids": task_ids}
 
 # -----------------------
 # GET /progress/{task_id} → SSE
@@ -183,7 +278,7 @@ async def start_download(background_tasks: BackgroundTasks,
 @app.get("/progress/{task_id}")
 async def progress_sse(task_id: str):
     if task_id not in progress_store:
-        raise HTTPException(404,"Task not found")
+        raise HTTPException(404, "Task not found")
     def gen():
         while True:
             d = progress_store[task_id]
@@ -200,9 +295,9 @@ async def progress_sse(task_id: str):
 async def fetch_file(task_id: str):
     info = progress_store.get(task_id)
     if not info:
-        raise HTTPException(404,"Task not found")
+        raise HTTPException(404, "Task not found")
     if info["status"] != "finished":
-        raise HTTPException(400,"Not ready")
+        raise HTTPException(400, "Not ready")
     return FileResponse(info["file_path"],
                         media_type="application/octet-stream",
                         filename=os.path.basename(info["file_path"]))
@@ -245,7 +340,7 @@ def run_download(task_id: str, url: str, fmt: str, quality: str):
             "preferredquality": "192"
         }]
 
-    # Video branch with correct 'preferedformat'
+    # Video branch
     elif f in video_exts:
         h = int(quality) if quality and quality.isdigit() else None
         if f == "mp4":
@@ -277,7 +372,7 @@ def run_download(task_id: str, url: str, fmt: str, quality: str):
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
 
-        # Scan for the final file in temp_dir
+        # Pick the final file (matching chosen extension)
         target_ext = f
         found = False
         for fn in os.listdir(temp_dir):
@@ -288,7 +383,6 @@ def run_download(task_id: str, url: str, fmt: str, quality: str):
                 })
                 found = True
                 break
-
         if not found:
             entries = list(os.scandir(temp_dir))
             if entries:
