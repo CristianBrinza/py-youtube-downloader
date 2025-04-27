@@ -1,9 +1,12 @@
 import os
 import shutil
 import tempfile
+import uuid
+import json
+import time
 import logging
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks, Body
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 import yt_dlp
 
 # Configure logging
@@ -22,6 +25,10 @@ if not FFMPEG_EXISTS:
 
 app = FastAPI()
 
+# In-memory progress store
+progress_store = {}
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     client = request.client.host if request.client else "unknown"
@@ -30,6 +37,7 @@ async def log_requests(request: Request, call_next):
     logger.info(f"← {resp.status_code} to {client}")
     return resp
 
+
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """<!DOCTYPE html>
@@ -37,98 +45,157 @@ async def home():
 <head><title>YouTube Downloader</title></head>
 <body>
   <h1>YouTube Downloader</h1>
-  <form action=\"/download\" method=\"get\">
-    <input type=\"text\" name=\"url\" placeholder=\"YouTube URL\" size=\"50\" required/>
-    <select name=\"fmt\">
-      <option value=\"mp4\">MP4</option>
-      <option value=\"mp3\">MP3</option>
-      <option value=\"avi\">AVI</option>
-      <option value=\"wav\">WAV</option>
-      <option value=\"m4a\">M4A</option>
-    </select>
-    <button type=\"submit\">Download</button>
-  </form>
+  <input type="text" id="url" placeholder="YouTube URL" size="50" />
+  <select id="fmt">
+    <option value="mp4">MP4</option>
+    <option value="mp3">MP3</option>
+    <option value="avi">AVI</option>
+    <option value="wav">WAV</option>
+    <option value="m4a">M4A</option>
+  </select>
+  <button id="btn">Download</button>
+  <br/><br/>
+  <progress id="prog" value="0" max="100" style="width:300px;"></progress>
+  <span id="percent"></span>
+  <div id="link"></div>
+
+  <script>
+    document.getElementById("btn").onclick = async () => {
+      const url = document.getElementById("url").value;
+      const fmt = document.getElementById("fmt").value;
+      const res = await fetch("/download", {
+        method: "POST",
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, fmt })
+      });
+      if (!res.ok) {
+        alert("Error: " + await res.text());
+        return;
+      }
+      const { task_id } = await res.json();
+      const es = new EventSource(`/progress/${task_id}`);
+      es.onmessage = e => {
+        const data = JSON.parse(e.data);
+        if (data.total_bytes) {
+          const pct = Math.floor(100 * data.downloaded_bytes / data.total_bytes);
+          document.getElementById("prog").value = pct;
+          document.getElementById("percent").innerText = pct + "%";
+        }
+        if (data.status === "finished") {
+          es.close();
+          document.getElementById("link").innerHTML =
+            `<a href="/download/${task_id}">Download your file</a>`;
+        }
+      };
+    };
+  </script>
 </body>
 </html>"""
 
-@app.get("/download")
-async def download(
-    url: str,
-    fmt: str = Query("mp4", regex="^[a-zA-Z0-9]+$")
+
+@app.post("/download")
+async def start_download(
+        background_tasks: BackgroundTasks,
+        url: str = Body(...),
+        fmt: str = Body("mp4")
 ):
-    logger.info(f"Download requested: url={url}, fmt={fmt}")
-    temp_dir = tempfile.mkdtemp(prefix="yt_dl_")
-    logger.info(f"Created temp dir: {temp_dir}")
-
-    ydl_opts = {
-        "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
-        "quiet": True,
+    # Initialize progress
+    task_id = str(uuid.uuid4())
+    progress_store[task_id] = {
+        "status": "queued",
+        "downloaded_bytes": 0,
+        "total_bytes": None,
+        "file_path": None
     }
+    # Launch background
+    background_tasks.add_task(run_download, task_id, url, fmt)
+    return {"task_id": task_id}
 
+
+@app.get("/progress/{task_id}")
+async def progress_sse(task_id: str):
+    if task_id not in progress_store:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    def event_generator():
+        while True:
+            data = progress_store.get(task_id)
+            if not data:
+                break
+            yield f"data: {json.dumps(data)}\n\n"
+            if data['status'] in ('finished', 'error'):
+                break
+            time.sleep(1)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/download/{task_id}")
+async def download_task(task_id: str):
+    info = progress_store.get(task_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if info['status'] != 'finished':
+        raise HTTPException(status_code=400, detail="Task not completed yet")
+    return FileResponse(
+        path=info['file_path'],
+        media_type="application/octet-stream",
+        filename=os.path.basename(info['file_path'])
+    )
+
+
+# Actual download logic
+
+def run_download(task_id: str, url: str, fmt: str):
+    temp_dir = tempfile.mkdtemp(prefix="yt_dl_")
+
+    def hook(d):
+        state = progress_store.get(task_id)
+        if not state:
+            return
+        status = d.get('status')
+        if status == 'downloading':
+            state.update({
+                'status': 'downloading',
+                'downloaded_bytes': d.get('downloaded_bytes', 0),
+                'total_bytes': d.get('total_bytes') or d.get('total_bytes_estimate')
+            })
+        elif status == 'finished':
+            state['status'] = 'finished'
+            state['file_path'] = d.get('filename')
+
+    # Build options
+    ydl_opts = {
+        'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+        'quiet': True,
+        'progress_hooks': [hook]
+    }
     audio_formats = {"mp3", "aac", "wav", "m4a", "flac", "opus"}
     fmt_l = fmt.lower()
-
     if fmt_l in audio_formats:
-        if not FFMPEG_EXISTS:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "ffmpeg/ffprobe not installed—cannot extract audio. "
-                    "Install with `brew install ffmpeg` or `sudo apt install ffmpeg`."
-                )
-            )
         ydl_opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": fmt_l,
-                "preferredquality": "192",
-            }],
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': fmt_l,
+                'preferredquality': '192',
+            }]
         })
-
-    elif fmt_l == "mp4":
-        ydl_opts["format"] = "best[ext=mp4]/best"
-
+    elif fmt_l == 'mp4':
+        ydl_opts['format'] = 'best[ext=mp4]/best'
     else:
-        if not FFMPEG_EXISTS:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    f"ffmpeg/ffprobe not installed—cannot convert to {fmt_l}. "
-                    "Install ffmpeg or use fmt=mp4 for native MP4."
-                )
-            )
         ydl_opts.update({
-            "format": "bestvideo+bestaudio",
-            "postprocessors": [{
-                "key": "FFmpegVideoConvertor",
-                "preferedformat": fmt_l,
-            }],
+            'format': 'bestvideo+bestaudio',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': fmt_l,
+            }]
         })
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logger.info("Starting yt_dlp.extract_info()")
-            info = ydl.extract_info(url, download=True)
-            logger.info("Download finished")
-            title = info.get("title", "video")
-            filename = f"{title}.{fmt_l}"
-            file_path = os.path.join(temp_dir, filename)
-
-            if not os.path.exists(file_path):
-                files = os.listdir(temp_dir)
-                if not files:
-                    raise FileNotFoundError("No file found after download.")
-                file_path = os.path.join(temp_dir, files[0])
-                logger.info(f"Fallback to {file_path}")
-
+            ydl.extract_info(url, download=True)
     except Exception as e:
-        logger.exception("Download/convert failed")
-        raise HTTPException(status_code=400, detail=str(e))
-
-    return FileResponse(
-        path=file_path,
-        media_type="application/octet-stream",
-        filename=os.path.basename(file_path),
-    )
+        progress_store[task_id]['status'] = 'error'
+        logger.error(f"Task {task_id} failed: {e}")
+        progress_store[task_id]['file_path'] = None
 
