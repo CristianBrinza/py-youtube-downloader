@@ -55,31 +55,25 @@ def label_from_height(h: int) -> str:
 # -----------------------
 @app.get("/formats")
 async def get_formats(url: str = Query(...)):
-    ydl_opts = {"quiet": True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
         info = ydl.extract_info(url, download=False)
     fmts = info.get("formats", [])
     video_map, audio_map = {}, {}
     for f in fmts:
         # video-only
-        if f.get("vcodec") != "none" and f.get("acodec") == "none":
+        if f.get("vcodec")!="none" and f.get("acodec")=="none":
             h = f.get("height")
-            if h and (h not in video_map or f.get("tbr",0) > video_map[h]["tbr"]):
-                video_map[h] = {"height":h, "tbr":f.get("tbr",0)}
+            if h and (h not in video_map or f["tbr"] > video_map[h]["tbr"]):
+                video_map[h] = {"height": h, "tbr": f["tbr"]}
         # audio-only
-        if f.get("acodec") != "none" and f.get("vcodec") == "none":
+        if f.get("acodec")!="none" and f.get("vcodec")=="none":
             abr = f.get("abr")
-            if abr and (abr not in audio_map or f.get("tbr",0)>audio_map[abr]["tbr"]):
-                audio_map[abr] = {"abr":abr, "tbr":f.get("tbr",0)}
-    video_list = [
-        {"height":h, "label":label_from_height(h)}
-        for h in sorted(video_map, reverse=True)
-    ]
-    audio_list = [
-        {"abr":abr, "label":f"{abr} kbps"}
-        for abr in sorted(audio_map, reverse=True)
-    ]
-    return {"video": video_list, "audio": audio_list}
+            if abr and (abr not in audio_map or f["tbr"] > audio_map[abr]["tbr"]):
+                audio_map[abr] = {"abr": abr, "tbr": f["tbr"]}
+    return {
+        "video": [{"height": h, "label": label_from_height(h)} for h in sorted(video_map, reverse=True)],
+        "audio": [{"abr": a, "label": f"{a} kbps"} for a in sorted(audio_map, reverse=True)]
+    }
 
 # -----------------------
 # GET / → UI
@@ -192,9 +186,10 @@ async def progress_sse(task_id: str):
         raise HTTPException(404,"Task not found")
     def gen():
         while True:
-            d=progress_store[task_id]
+            d = progress_store[task_id]
             yield f"data: {json.dumps(d)}\n\n"
-            if d["status"] in ("finished","error"): break
+            if d["status"] in ("finished","error"):
+                break
             time.sleep(0.5)
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -203,86 +198,107 @@ async def progress_sse(task_id: str):
 # -----------------------
 @app.get("/download/{task_id}")
 async def fetch_file(task_id: str):
-    info=progress_store.get(task_id)
-    if not info: raise HTTPException(404,"Task not found")
-    if info["status"]!="finished": raise HTTPException(400,"Not ready")
+    info = progress_store.get(task_id)
+    if not info:
+        raise HTTPException(404,"Task not found")
+    if info["status"] != "finished":
+        raise HTTPException(400,"Not ready")
     return FileResponse(info["file_path"],
                         media_type="application/octet-stream",
                         filename=os.path.basename(info["file_path"]))
 
 # -----------------------
-# Background download logic
+# Background download + conversion
 # -----------------------
 def run_download(task_id: str, url: str, fmt: str, quality: str):
-    temp_dir=tempfile.mkdtemp(prefix="yt_dl_")
-    def hook(d):
-        st=progress_store[task_id]
-        if d.get("status")=="downloading":
+    temp_dir = tempfile.mkdtemp(prefix="yt_dl_")
+
+    def progress_hook(d):
+        if d.get("status") == "downloading":
+            st = progress_store[task_id]
             st.update({
-                "status":"downloading",
-                "downloaded_bytes":d.get("downloaded_bytes",0),
-                "total_bytes":d.get("total_bytes") or d.get("total_bytes_estimate",0)
+                "status": "downloading",
+                "downloaded_bytes": d.get("downloaded_bytes", 0),
+                "total_bytes":    d.get("total_bytes") or d.get("total_bytes_estimate", 0)
             })
-        elif d.get("status")=="finished":
-            st.update({"status":"finished","file_path":d.get("filename")})
 
-    opts={
-        "outtmpl":os.path.join(temp_dir,"%(title)s.%(ext)s"),
-        "quiet":True,
-        "progress_hooks":[hook]
+    audio_exts = {"mp3","aac","wav","flac","m4a","opus"}
+    video_exts = {"mp4","webm","mkv","avi"}
+    f = fmt.lower()
+
+    opts = {
+        "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+        "quiet": True,
+        "progress_hooks": [progress_hook],
     }
-
-    audio_exts={"mp3","aac","wav","flac","m4a","opus"}
-    video_exts={"mp4","webm","mkv","avi"}
-    f=fmt.lower()
 
     # Audio branch
     if f in audio_exts:
         if not FFMPEG_EXISTS:
-            progress_store[task_id]["status"]="error"
+            progress_store[task_id]["status"] = "error"
             return
-        # set format filter by abr
-        abr=int(quality) if quality and quality.isdigit() else None
-        opts["format"] = (f"bestaudio[abr<={abr}]/bestaudio" if abr else "bestaudio")
-        opts["postprocessors"]=[{
-            "key":"FFmpegExtractAudio",
-            "preferredcodec":f,
-            "preferredquality":"192"
+        abr = int(quality) if quality and quality.isdigit() else None
+        opts["format"] = f"bestaudio[abr<={abr}]/bestaudio" if abr else "bestaudio"
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": f,
+            "preferredquality": "192"
         }]
 
-    # Video branch
+    # Video branch with correct 'preferedformat'
     elif f in video_exts:
-        h=int(quality) if quality and quality.isdigit() else None
-        if f=="mp4":
+        h = int(quality) if quality and quality.isdigit() else None
+        if f == "mp4":
             if h:
-                # merge & convert if quality chosen
-                if not FFMPEG_EXISTS:
-                    progress_store[task_id]["status"]="error"
-                    return
-                opts["format"]=f"bestvideo[height<={h}]+bestaudio/best"
-                opts["postprocessors"]=[{"key":"FFmpegVideoConvertor","preferedformat":f}]
+                opts["format"] = f"bestvideo[height<={h}]+bestaudio/best"
+                opts["postprocessors"] = [{
+                    "key": "FFmpegVideoConvertor",
+                    "preferedformat": f
+                }]
+                opts["merge_output_format"] = f
             else:
-                # progressive MP4
-                opts["format"]="best[ext=mp4]/best"
+                opts["format"] = "best[ext=mp4]/best"
         else:
-            # other containers always require ffmpeg
-            if not FFMPEG_EXISTS:
-                progress_store[task_id]["status"]="error"
-                return
             if h:
-                opts["format"]=f"bestvideo[height<={h}]+bestaudio/best"
+                opts["format"] = f"bestvideo[height<={h}]+bestaudio/best"
             else:
-                opts["format"]="bestvideo+bestaudio"
-            opts["postprocessors"]=[{"key":"FFmpegVideoConvertor","preferedformat":f}]
+                opts["format"] = "bestvideo+bestaudio"
+            opts["postprocessors"] = [{
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": f
+            }]
+            opts["merge_output_format"] = f
 
     else:
-        # unknown format
-        progress_store[task_id]["status"]="error"
+        progress_store[task_id]["status"] = "error"
         return
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
+
+        # Scan for the final file in temp_dir
+        target_ext = f
+        found = False
+        for fn in os.listdir(temp_dir):
+            if fn.lower().endswith(f".{target_ext}"):
+                progress_store[task_id].update({
+                    "status": "finished",
+                    "file_path": os.path.join(temp_dir, fn)
+                })
+                found = True
+                break
+
+        if not found:
+            entries = list(os.scandir(temp_dir))
+            if entries:
+                progress_store[task_id].update({
+                    "status": "finished",
+                    "file_path": entries[0].path
+                })
+            else:
+                progress_store[task_id]["status"] = "error"
+
     except Exception as e:
         logger.error(f"Task {task_id} error: {e}")
-        progress_store[task_id]["status"]="error"
+        progress_store[task_id]["status"] = "error"
