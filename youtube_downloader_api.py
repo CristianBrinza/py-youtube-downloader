@@ -3,7 +3,7 @@ import shutil
 import tempfile
 import logging
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 import yt_dlp
 
 # Configure logging
@@ -30,6 +30,27 @@ async def log_requests(request: Request, call_next):
     logger.info(f"← {resp.status_code} to {client}")
     return resp
 
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return """<!DOCTYPE html>
+<html>
+<head><title>YouTube Downloader</title></head>
+<body>
+  <h1>YouTube Downloader</h1>
+  <form action=\"/download\" method=\"get\">
+    <input type=\"text\" name=\"url\" placeholder=\"YouTube URL\" size=\"50\" required/>
+    <select name=\"fmt\">
+      <option value=\"mp4\">MP4</option>
+      <option value=\"mp3\">MP3</option>
+      <option value=\"avi\">AVI</option>
+      <option value=\"wav\">WAV</option>
+      <option value=\"m4a\">M4A</option>
+    </select>
+    <button type=\"submit\">Download</button>
+  </form>
+</body>
+</html>"""
+
 @app.get("/download")
 async def download(
     url: str,
@@ -48,7 +69,6 @@ async def download(
     fmt_l = fmt.lower()
 
     if fmt_l in audio_formats:
-        # audio extraction requires ffmpeg/ffprobe
         if not FFMPEG_EXISTS:
             raise HTTPException(
                 status_code=500,
@@ -67,11 +87,9 @@ async def download(
         })
 
     elif fmt_l == "mp4":
-        # progressive MP4 (no merging needed)
         ydl_opts["format"] = "best[ext=mp4]/best"
 
     else:
-        # other video formats require ffmpeg/ffprobe
         if not FFMPEG_EXISTS:
             raise HTTPException(
                 status_code=500,
@@ -97,7 +115,6 @@ async def download(
             filename = f"{title}.{fmt_l}"
             file_path = os.path.join(temp_dir, filename)
 
-            # fallback if filename differs
             if not os.path.exists(file_path):
                 files = os.listdir(temp_dir)
                 if not files:
@@ -114,3 +131,4 @@ async def download(
         media_type="application/octet-stream",
         filename=os.path.basename(file_path),
     )
+
